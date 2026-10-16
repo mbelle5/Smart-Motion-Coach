@@ -1,0 +1,565 @@
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+import math
+
+# ==========================================
+# SMART MOTION COACH - SQUAT FORM CHECKER
+# ==========================================
+
+MODEL_PATH = "pose_landmarker_lite.task"
+
+BaseOptions = mp.tasks.BaseOptions
+PoseLandmarker = mp.tasks.vision.PoseLandmarker
+PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+RunningMode = mp.tasks.vision.RunningMode
+
+# Body landmark connections
+POSE_CONNECTIONS = [
+    (11, 12),
+    (11, 13), (13, 15),
+    (12, 14), (14, 16),
+    (11, 23), (12, 24),
+    (23, 24),
+    (23, 25), (25, 27),
+    (24, 26), (26, 28),
+    (27, 29), (29, 31),
+    (28, 30), (30, 32)
+]
+
+# Experimental thresholds
+SQUAT_DOWN_ANGLE = 100
+SQUAT_UP_ANGLE = 160
+TORSO_LEAN_LIMIT = 45
+MIN_VISIBILITY = 0.5
+
+# ==========================================
+# ANGLE CALCULATIONS
+# ==========================================
+
+def calculate_angle_3d(a, b, c):
+    """Calculate angle at point b using 3D coordinates."""
+
+    a = np.array(a, dtype=float)
+    b = np.array(b, dtype=float)
+    c = np.array(c, dtype=float)
+
+    ba = a - b
+    bc = c - b
+
+    denominator = (
+        np.linalg.norm(ba) *
+        np.linalg.norm(bc)
+    )
+
+    if denominator < 1e-8:
+        return None
+
+    cosine_angle = (
+        np.dot(ba, bc) / denominator
+    )
+
+    angle = np.degrees(
+        np.arccos(
+            np.clip(cosine_angle, -1.0, 1.0)
+        )
+    )
+
+    return float(angle)
+
+
+def world_point(landmarks, index):
+    """Get estimated 3D coordinates."""
+
+    landmark = landmarks[index]
+
+    return [
+        landmark.x,
+        landmark.y,
+        landmark.z
+    ]
+
+
+def screen_point(landmarks, index, width, height):
+    """Convert normalized coordinates to pixels."""
+
+    landmark = landmarks[index]
+
+    return (
+        int(landmark.x * width),
+        int(landmark.y * height)
+    )
+
+
+def leg_confidence(landmarks, indices):
+    """Return lowest visibility of the three joints."""
+
+    return min(
+        landmarks[i].visibility
+        for i in indices
+    )
+
+
+def calculate_torso_lean(
+    landmarks, shoulder_index, hip_index
+):
+    """Estimate torso lean using 3D world coordinates."""
+
+    shoulder = np.array(
+        world_point(landmarks, shoulder_index)
+    )
+
+    hip = np.array(
+        world_point(landmarks, hip_index)
+    )
+
+    torso = shoulder - hip
+
+    horizontal = math.sqrt(
+        torso[0] ** 2 + torso[2] ** 2
+    )
+
+    vertical = abs(torso[1])
+
+    return math.degrees(
+        math.atan2(horizontal, vertical)
+    )
+
+
+# ==========================================
+# TRACKING VARIABLES
+# ==========================================
+
+squat_count = 0
+squat_stage = "up"
+
+feedback = "Move into camera view"
+previous_feedback = ""
+feedback_until = 0
+
+tracking_leg = "None"
+
+# ==========================================
+# MEDIAPIPE SETUP
+# ==========================================
+
+options = PoseLandmarkerOptions(
+    base_options=BaseOptions(
+        model_asset_path=MODEL_PATH
+    ),
+    running_mode=RunningMode.VIDEO,
+    num_poses=1
+)
+
+camera = cv2.VideoCapture(0)
+
+if not camera.isOpened():
+    print("Could not open webcam.")
+    raise SystemExit
+
+start_time = time.monotonic()
+last_timestamp_ms = -1
+
+# ==========================================
+# MAIN CAMERA LOOP
+# ==========================================
+
+try:
+    with PoseLandmarker.create_from_options(
+        options
+    ) as landmarker:
+
+        while True:
+
+            success, frame = camera.read()
+
+            if not success:
+                print("Failed to capture frame.")
+                break
+
+            frame = cv2.flip(frame, 1)
+
+            height, width = frame.shape[:2]
+
+            # Convert image to RGB
+            rgb_frame = cv2.cvtColor(
+                frame,
+                cv2.COLOR_BGR2RGB
+            )
+
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=rgb_frame
+            )
+
+            # Generate timestamps
+            timestamp_ms = max(
+                int(
+                    (time.monotonic() - start_time)
+                    * 1000
+                ),
+                last_timestamp_ms + 1
+            )
+
+            last_timestamp_ms = timestamp_ms
+
+            # Detect pose
+            result = landmarker.detect_for_video(
+                mp_image,
+                timestamp_ms
+            )
+
+            feedback = "Move into camera view"
+            feedback_color = (0, 255, 255)
+
+            left_angle = None
+            right_angle = None
+            torso_lean = None
+            tracking_leg = "None"
+
+            if (
+                result.pose_landmarks
+                and result.pose_world_landmarks
+            ):
+
+                screen_landmarks = (
+                    result.pose_landmarks[0]
+                )
+
+                world_landmarks = (
+                    result.pose_world_landmarks[0]
+                )
+
+                # ==================================
+                # DRAW BODY SKELETON
+                # ==================================
+
+                for start, end in POSE_CONNECTIONS:
+
+                    if min(
+                        screen_landmarks[start].visibility,
+                        screen_landmarks[end].visibility
+                    ) < MIN_VISIBILITY:
+                        continue
+
+                    p1 = screen_point(
+                        screen_landmarks,
+                        start,
+                        width,
+                        height
+                    )
+
+                    p2 = screen_point(
+                        screen_landmarks,
+                        end,
+                        width,
+                        height
+                    )
+
+                    cv2.line(
+                        frame,
+                        p1,
+                        p2,
+                        (255, 0, 0),
+                        3
+                    )
+
+                # Draw visible landmarks
+                for landmark in screen_landmarks:
+
+                    if landmark.visibility < MIN_VISIBILITY:
+                        continue
+
+                    x = int(landmark.x * width)
+                    y = int(landmark.y * height)
+
+                    cv2.circle(
+                        frame,
+                        (x, y),
+                        5,
+                        (0, 255, 0),
+                        -1
+                    )
+
+                # ==================================
+                # CALCULATE 3D KNEE ANGLES
+                # ==================================
+
+                left_indices = [23, 25, 27]
+                right_indices = [24, 26, 28]
+
+                left_confidence = leg_confidence(
+                    screen_landmarks,
+                    left_indices
+                )
+
+                right_confidence = leg_confidence(
+                    screen_landmarks,
+                    right_indices
+                )
+
+                if left_confidence >= MIN_VISIBILITY:
+
+                    left_angle = calculate_angle_3d(
+                        world_point(world_landmarks, 23),
+                        world_point(world_landmarks, 25),
+                        world_point(world_landmarks, 27)
+                    )
+
+                if right_confidence >= MIN_VISIBILITY:
+
+                    right_angle = calculate_angle_3d(
+                        world_point(world_landmarks, 24),
+                        world_point(world_landmarks, 26),
+                        world_point(world_landmarks, 28)
+                    )
+
+                # ==================================
+                # SELECT RELIABLE LEG TRACKING
+                # ==================================
+
+                knee_angle = None
+
+                if (
+                    left_angle is not None
+                    and right_angle is not None
+                ):
+
+                    knee_angle = (
+                        left_angle + right_angle
+                    ) / 2
+
+                    tracking_leg = "Both Legs"
+
+                elif left_angle is not None:
+
+                    knee_angle = left_angle
+                    tracking_leg = "Left Leg"
+
+                elif right_angle is not None:
+
+                    knee_angle = right_angle
+                    tracking_leg = "Right Leg"
+
+                # ==================================
+                # CALCULATE TORSO LEAN
+                # ==================================
+
+                if leg_confidence(
+                    screen_landmarks,
+                    [11, 23]
+                ) >= MIN_VISIBILITY:
+
+                    torso_lean = calculate_torso_lean(
+                        world_landmarks,
+                        11,
+                        23
+                    )
+
+                elif leg_confidence(
+                    screen_landmarks,
+                    [12, 24]
+                ) >= MIN_VISIBILITY:
+
+                    torso_lean = calculate_torso_lean(
+                        world_landmarks,
+                        12,
+                        24
+                    )
+
+                # ==================================
+                # SQUAT COUNTING
+                # ==================================
+
+                if knee_angle is not None:
+
+                    if knee_angle < SQUAT_DOWN_ANGLE:
+                        squat_stage = "down"
+
+                    if (
+                        knee_angle > SQUAT_UP_ANGLE
+                        and squat_stage == "down"
+                    ):
+
+                        squat_stage = "up"
+                        squat_count += 1
+
+                        feedback_until = (
+                            time.monotonic() + 1.5
+                        )
+
+                        print(
+                            "Squat completed:",
+                            squat_count
+                        )
+
+                    # ==============================
+                    # EXERCISE FEEDBACK
+                    # ==============================
+
+                    if (
+                        torso_lean is not None
+                        and torso_lean > TORSO_LEAN_LIMIT
+                        and knee_angle < SQUAT_UP_ANGLE
+                    ):
+
+                        feedback = "Check torso lean"
+                        feedback_color = (0, 0, 255)
+
+                    elif (
+                        time.monotonic() < feedback_until
+                    ):
+
+                        feedback = "Rep completed!"
+                        feedback_color = (0, 255, 0)
+
+                    elif knee_angle < SQUAT_DOWN_ANGLE:
+
+                        feedback = "Target depth reached!"
+                        feedback_color = (0, 255, 0)
+
+                    elif knee_angle <= SQUAT_UP_ANGLE:
+
+                        if squat_stage == "down":
+                            feedback = "Stand back up!"
+                        else:
+                            feedback = "Bend your knees more"
+
+                        feedback_color = (0, 255, 255)
+
+                    else:
+
+                        feedback = "Standing position"
+                        feedback_color = (255, 255, 255)
+
+                else:
+
+                    feedback = "Cannot track knees"
+                    feedback_color = (0, 0, 255)
+
+            # ==================================
+            # DISPLAY INFORMATION
+            # ==================================
+
+            def draw_text(text, y, color=(255, 255, 255)):
+
+                cv2.putText(
+                    frame,
+                    text,
+                    (20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    color,
+                    2
+                )
+
+            draw_text(
+                f"Squats: {squat_count}",
+                40,
+                (0, 255, 0)
+            )
+
+            draw_text(
+                f"Stage: {squat_stage}",
+                75
+            )
+
+            draw_text(
+                f"Tracking: {tracking_leg}",
+                110
+            )
+
+            draw_text(
+                "Left Knee: " +
+                (
+                    f"{left_angle:.0f} deg"
+                    if left_angle is not None
+                    else "Not visible"
+                ),
+                145
+            )
+
+            draw_text(
+                "Right Knee: " +
+                (
+                    f"{right_angle:.0f} deg"
+                    if right_angle is not None
+                    else "Not visible"
+                ),
+                180
+            )
+
+            draw_text(
+                "Torso Lean: " +
+                (
+                    f"{torso_lean:.0f} deg"
+                    if torso_lean is not None
+                    else "Not visible"
+                ),
+                215
+            )
+
+            # ==================================
+            # FEEDBACK BANNER
+            # ==================================
+
+            cv2.rectangle(
+                frame,
+                (0, height - 85),
+                (width, height),
+                (30, 30, 30),
+                -1
+            )
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.85
+
+            text_width = cv2.getTextSize(
+                feedback,
+                font,
+                font_scale,
+                2
+            )[0][0]
+
+            if text_width > width - 30:
+                font_scale *= (
+                    (width - 30) / text_width
+                )
+
+            cv2.putText(
+                frame,
+                feedback,
+                (15, height - 30),
+                font,
+                font_scale,
+                feedback_color,
+                2
+            )
+
+            # Print feedback to terminal
+            if feedback != previous_feedback:
+
+                print(
+                    "Exercise Feedback:",
+                    feedback
+                )
+
+                previous_feedback = feedback
+
+            # Display webcam
+            cv2.imshow(
+                "Smart Motion Coach - 3D Squat Tracking",
+                frame
+            )
+
+            # Press Q to exit
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+finally:
+    camera.release()
+    cv2.destroyAllWindows()
+
+print("Total squats completed:", squat_count)
