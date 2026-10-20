@@ -1,21 +1,34 @@
 
 import cv2
 import mediapipe as mp
-import numpy as np
 import time
+from pathlib import Path
+
+# Shared geometry functions used across exercise trackers.
+from core.geometry import (
+    calculate_angle,
+    world_point,
+    screen_point,
+    visible,
+)
+
 
 # ==========================================
 # SMART MOTION COACH - ARM RAISE TRACKER
 # ==========================================
 
-MODEL_PATH = "pose_landmarker_lite.task"
+# Find the model relative to this file, regardless of terminal location.
+MODEL_PATH = str(
+    Path(__file__).resolve().parent / "pose_landmarker_lite.task"
+)
 
 BaseOptions = mp.tasks.BaseOptions
 PoseLandmarker = mp.tasks.vision.PoseLandmarker
 PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
 RunningMode = mp.tasks.vision.RunningMode
 
-# Skeleton connections
+
+# Skeleton connections for drawing the tracked body.
 POSE_CONNECTIONS = [
     (11, 12),
     (11, 13), (13, 15),
@@ -26,61 +39,11 @@ POSE_CONNECTIONS = [
     (24, 26), (26, 28)
 ]
 
-# Experimental angle thresholds
+
+# Experimental thresholds for detecting arm raises.
 ARMS_DOWN_ANGLE = 25
 ARMS_UP_ANGLE = 80
 MIN_VISIBILITY = 0.5
-
-# ==========================================
-# ANGLE CALCULATION
-# ==========================================
-
-def calculate_angle(a, b, c):
-    """Calculate angle at point b using 3D coordinates."""
-
-    a = np.array(a, dtype=float)
-    b = np.array(b, dtype=float)
-    c = np.array(c, dtype=float)
-
-    ba = a - b
-    bc = c - b
-
-    denominator = (
-        np.linalg.norm(ba) * np.linalg.norm(bc)
-    )
-
-    if denominator < 1e-8:
-        return None
-
-    cosine_angle = np.dot(ba, bc) / denominator
-
-    return float(
-        np.degrees(
-            np.arccos(
-                np.clip(cosine_angle, -1.0, 1.0)
-            )
-        )
-    )
-
-
-def world_point(landmarks, index):
-    landmark = landmarks[index]
-    return [landmark.x, landmark.y, landmark.z]
-
-
-def screen_point(landmarks, index, width, height):
-    landmark = landmarks[index]
-    return (
-        int(landmark.x * width),
-        int(landmark.y * height)
-    )
-
-
-def visible(landmarks, indices):
-    return all(
-        landmarks[i].visibility >= MIN_VISIBILITY
-        for i in indices
-    )
 
 
 # ==========================================
@@ -91,6 +54,7 @@ rep_count = 0
 arm_stage = "down"
 previous_feedback = ""
 feedback_until = 0
+
 
 # ==========================================
 # MEDIAPIPE SETUP
@@ -113,6 +77,7 @@ if not camera.isOpened():
 start_time = time.monotonic()
 last_timestamp_ms = -1
 
+
 # ==========================================
 # MAIN CAMERA LOOP
 # ==========================================
@@ -127,11 +92,14 @@ try:
                 print("Failed to capture frame.")
                 break
 
+            # Mirror the camera for easier movement tracking.
             frame = cv2.flip(frame, 1)
             height, width = frame.shape[:2]
 
+            # Convert OpenCV's BGR image to RGB for MediaPipe.
             rgb_frame = cv2.cvtColor(
-                frame, cv2.COLOR_BGR2RGB
+                frame,
+                cv2.COLOR_BGR2RGB
             )
 
             mp_image = mp.Image(
@@ -139,12 +107,14 @@ try:
                 data=rgb_frame
             )
 
+            # MediaPipe video mode requires increasing timestamps.
             timestamp_ms = max(
                 int((time.monotonic() - start_time) * 1000),
                 last_timestamp_ms + 1
             )
             last_timestamp_ms = timestamp_ms
 
+            # Detect the body position in this frame.
             result = landmarker.detect_for_video(
                 mp_image,
                 timestamp_ms
@@ -163,8 +133,13 @@ try:
                 screen_landmarks = result.pose_landmarks[0]
                 world_landmarks = result.pose_world_landmarks[0]
 
-                # Draw skeleton
+                # ==================================
+                # DRAW BODY SKELETON
+                # ==================================
+
                 for start, end in POSE_CONNECTIONS:
+
+                    # Only draw connections with visible joints.
                     if visible(screen_landmarks, [start, end]):
                         cv2.line(
                             frame,
@@ -184,7 +159,7 @@ try:
                             3
                         )
 
-                # Draw visible body landmarks
+                # Draw a green circle for each visible landmark.
                 for landmark in screen_landmarks:
                     if landmark.visibility >= MIN_VISIBILITY:
                         cv2.circle(
@@ -198,8 +173,11 @@ try:
                             -1
                         )
 
-                # Left shoulder angle:
-                # Elbow -> Shoulder -> Hip
+                # ==================================
+                # CALCULATE SHOULDER ANGLES
+                # ==================================
+
+                # Left shoulder angle: Elbow -> Shoulder -> Hip
                 if visible(screen_landmarks, [13, 11, 23]):
                     left_angle = calculate_angle(
                         world_point(world_landmarks, 13),
@@ -207,8 +185,7 @@ try:
                         world_point(world_landmarks, 23)
                     )
 
-                # Right shoulder angle:
-                # Elbow -> Shoulder -> Hip
+                # Right shoulder angle: Elbow -> Shoulder -> Hip
                 if visible(screen_landmarks, [14, 12, 24]):
                     right_angle = calculate_angle(
                         world_point(world_landmarks, 14),
@@ -216,7 +193,11 @@ try:
                         world_point(world_landmarks, 24)
                     )
 
-                # Both arms must be visible
+                # ==================================
+                # ARM RAISE COUNTING
+                # ==================================
+
+                # Both arms must be tracked to count a repetition.
                 if (
                     left_angle is not None
                     and right_angle is not None
@@ -231,15 +212,13 @@ try:
                         and right_angle > ARMS_UP_ANGLE
                     )
 
-                    # Start a repetition when both arms
-                    # reach the raised position
+                    # Begin a repetition when both arms reach the raised position.
                     if both_up and arm_stage == "down":
                         arm_stage = "up"
                         feedback = "Target reached!"
                         feedback_color = (0, 255, 0)
 
-                    # Count a repetition when both arms
-                    # return to the lowered position
+                    # Complete a repetition when both arms return down.
                     elif both_down and arm_stage == "up":
                         arm_stage = "down"
                         rep_count += 1
@@ -247,7 +226,10 @@ try:
 
                         print("Arm raise completed:", rep_count)
 
-                    # Live feedback
+                    # ==================================
+                    # EXERCISE FEEDBACK
+                    # ==================================
+
                     if time.monotonic() < feedback_until:
                         feedback = "Rep completed!"
                         feedback_color = (0, 255, 0)
@@ -327,7 +309,10 @@ try:
                 2
             )
 
-            # Feedback banner
+            # ==================================
+            # FEEDBACK BANNER
+            # ==================================
+
             cv2.rectangle(
                 frame,
                 (0, height - 85),
@@ -340,9 +325,13 @@ try:
             font_scale = 0.85
 
             text_width = cv2.getTextSize(
-                feedback, font, font_scale, 2
+                feedback,
+                font,
+                font_scale,
+                2
             )[0][0]
 
+            # Make long feedback messages fit inside the window.
             if text_width > width - 30:
                 font_scale *= (width - 30) / text_width
 
@@ -356,18 +345,18 @@ try:
                 2
             )
 
-            # Print feedback when it changes
+            # Print feedback only when the message changes.
             if feedback != previous_feedback:
                 print("Exercise Feedback:", feedback)
                 previous_feedback = feedback
 
-            # Show webcam
+            # Display the webcam feed.
             cv2.imshow(
                 "Smart Motion Coach - Arm Raise Tracker",
                 frame
             )
 
-            # Press Q to exit
+            # Press Q to exit.
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 

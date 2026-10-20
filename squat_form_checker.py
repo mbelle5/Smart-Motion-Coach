@@ -4,19 +4,33 @@ import mediapipe as mp
 import numpy as np
 import time
 import math
+from pathlib import Path
+
+# Shared geometry functions used by multiple exercise trackers.
+from core.geometry import (
+    calculate_angle as calculate_angle_3d,
+    world_point,
+    screen_point,
+    leg_confidence,
+)
+
 
 # ==========================================
 # SMART MOTION COACH - SQUAT FORM CHECKER
 # ==========================================
 
-MODEL_PATH = "pose_landmarker_lite.task"
+# Locate the model relative to this script instead of the terminal directory.
+MODEL_PATH = str(
+    Path(__file__).resolve().parent / "pose_landmarker_lite.task"
+)
 
 BaseOptions = mp.tasks.BaseOptions
 PoseLandmarker = mp.tasks.vision.PoseLandmarker
 PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
 RunningMode = mp.tasks.vision.RunningMode
 
-# Body landmark connections
+
+# Body landmark connections used to draw the skeleton.
 POSE_CONNECTIONS = [
     (11, 12),
     (11, 13), (13, 15),
@@ -29,83 +43,20 @@ POSE_CONNECTIONS = [
     (28, 30), (30, 32)
 ]
 
-# Experimental thresholds
+
+# Experimental thresholds for identifying squat positions.
 SQUAT_DOWN_ANGLE = 100
 SQUAT_UP_ANGLE = 160
 TORSO_LEAN_LIMIT = 45
 MIN_VISIBILITY = 0.5
 
+
 # ==========================================
-# ANGLE CALCULATIONS
+# TORSO LEAN CALCULATION
 # ==========================================
 
-def calculate_angle_3d(a, b, c):
-    """Calculate angle at point b using 3D coordinates."""
-
-    a = np.array(a, dtype=float)
-    b = np.array(b, dtype=float)
-    c = np.array(c, dtype=float)
-
-    ba = a - b
-    bc = c - b
-
-    denominator = (
-        np.linalg.norm(ba) *
-        np.linalg.norm(bc)
-    )
-
-    if denominator < 1e-8:
-        return None
-
-    cosine_angle = (
-        np.dot(ba, bc) / denominator
-    )
-
-    angle = np.degrees(
-        np.arccos(
-            np.clip(cosine_angle, -1.0, 1.0)
-        )
-    )
-
-    return float(angle)
-
-
-def world_point(landmarks, index):
-    """Get estimated 3D coordinates."""
-
-    landmark = landmarks[index]
-
-    return [
-        landmark.x,
-        landmark.y,
-        landmark.z
-    ]
-
-
-def screen_point(landmarks, index, width, height):
-    """Convert normalized coordinates to pixels."""
-
-    landmark = landmarks[index]
-
-    return (
-        int(landmark.x * width),
-        int(landmark.y * height)
-    )
-
-
-def leg_confidence(landmarks, indices):
-    """Return lowest visibility of the three joints."""
-
-    return min(
-        landmarks[i].visibility
-        for i in indices
-    )
-
-
-def calculate_torso_lean(
-    landmarks, shoulder_index, hip_index
-):
-    """Estimate torso lean using 3D world coordinates."""
+def calculate_torso_lean(landmarks, shoulder_index, hip_index):
+    """Estimate how far the torso leans away from vertical."""
 
     shoulder = np.array(
         world_point(landmarks, shoulder_index)
@@ -115,14 +66,17 @@ def calculate_torso_lean(
         world_point(landmarks, hip_index)
     )
 
+    # The vector from the hip to the shoulder describes torso direction.
     torso = shoulder - hip
 
+    # Horizontal movement includes both side-to-side and forward/backward lean.
     horizontal = math.sqrt(
         torso[0] ** 2 + torso[2] ** 2
     )
 
     vertical = abs(torso[1])
 
+    # atan2 gives the lean angle relative to the vertical direction.
     return math.degrees(
         math.atan2(horizontal, vertical)
     )
@@ -140,6 +94,7 @@ previous_feedback = ""
 feedback_until = 0
 
 tracking_leg = "None"
+
 
 # ==========================================
 # MEDIAPIPE SETUP
@@ -162,14 +117,13 @@ if not camera.isOpened():
 start_time = time.monotonic()
 last_timestamp_ms = -1
 
+
 # ==========================================
 # MAIN CAMERA LOOP
 # ==========================================
 
 try:
-    with PoseLandmarker.create_from_options(
-        options
-    ) as landmarker:
+    with PoseLandmarker.create_from_options(options) as landmarker:
 
         while True:
 
@@ -179,11 +133,12 @@ try:
                 print("Failed to capture frame.")
                 break
 
+            # Mirror the camera so movement feels more natural.
             frame = cv2.flip(frame, 1)
 
             height, width = frame.shape[:2]
 
-            # Convert image to RGB
+            # MediaPipe expects an RGB image.
             rgb_frame = cv2.cvtColor(
                 frame,
                 cv2.COLOR_BGR2RGB
@@ -194,18 +149,17 @@ try:
                 data=rgb_frame
             )
 
-            # Generate timestamps
+            # Video timestamps must increase with every processed frame.
             timestamp_ms = max(
                 int(
-                    (time.monotonic() - start_time)
-                    * 1000
+                    (time.monotonic() - start_time) * 1000
                 ),
                 last_timestamp_ms + 1
             )
 
             last_timestamp_ms = timestamp_ms
 
-            # Detect pose
+            # Detect body landmarks in the current camera frame.
             result = landmarker.detect_for_video(
                 mp_image,
                 timestamp_ms
@@ -224,13 +178,8 @@ try:
                 and result.pose_world_landmarks
             ):
 
-                screen_landmarks = (
-                    result.pose_landmarks[0]
-                )
-
-                world_landmarks = (
-                    result.pose_world_landmarks[0]
-                )
+                screen_landmarks = result.pose_landmarks[0]
+                world_landmarks = result.pose_world_landmarks[0]
 
                 # ==================================
                 # DRAW BODY SKELETON
@@ -238,6 +187,7 @@ try:
 
                 for start, end in POSE_CONNECTIONS:
 
+                    # Skip connections if either joint is not visible enough.
                     if min(
                         screen_landmarks[start].visibility,
                         screen_landmarks[end].visibility
@@ -266,7 +216,7 @@ try:
                         3
                     )
 
-                # Draw visible landmarks
+                # Draw a green circle for each visible landmark.
                 for landmark in screen_landmarks:
 
                     if landmark.visibility < MIN_VISIBILITY:
@@ -287,6 +237,7 @@ try:
                 # CALCULATE 3D KNEE ANGLES
                 # ==================================
 
+                # Hip, knee, and ankle landmarks for each leg.
                 left_indices = [23, 25, 27]
                 right_indices = [24, 26, 28]
 
@@ -322,6 +273,7 @@ try:
 
                 knee_angle = None
 
+                # Average both knee angles when both legs are visible.
                 if (
                     left_angle is not None
                     and right_angle is not None
@@ -347,6 +299,7 @@ try:
                 # CALCULATE TORSO LEAN
                 # ==================================
 
+                # Use the left side when visible, otherwise try the right.
                 if leg_confidence(
                     screen_landmarks,
                     [11, 23]
@@ -375,9 +328,11 @@ try:
 
                 if knee_angle is not None:
 
+                    # A squat starts when the knee bends past the down threshold.
                     if knee_angle < SQUAT_DOWN_ANGLE:
                         squat_stage = "down"
 
+                    # Count one rep only after returning to standing.
                     if (
                         knee_angle > SQUAT_UP_ANGLE
                         and squat_stage == "down"
@@ -408,9 +363,7 @@ try:
                         feedback = "Check torso lean"
                         feedback_color = (0, 0, 255)
 
-                    elif (
-                        time.monotonic() < feedback_until
-                    ):
+                    elif time.monotonic() < feedback_until:
 
                         feedback = "Rep completed!"
                         feedback_color = (0, 255, 0)
@@ -444,6 +397,7 @@ try:
             # ==================================
 
             def draw_text(text, y, color=(255, 255, 255)):
+                """Draw a line of information on the camera frame."""
 
                 cv2.putText(
                     frame,
@@ -523,6 +477,7 @@ try:
                 2
             )[0][0]
 
+            # Reduce font size if the feedback is too wide.
             if text_width > width - 30:
                 font_scale *= (
                     (width - 30) / text_width
@@ -538,7 +493,7 @@ try:
                 2
             )
 
-            # Print feedback to terminal
+            # Print feedback only when the message changes.
             if feedback != previous_feedback:
 
                 print(
@@ -548,17 +503,18 @@ try:
 
                 previous_feedback = feedback
 
-            # Display webcam
+            # Display the webcam feed.
             cv2.imshow(
                 "Smart Motion Coach - 3D Squat Tracking",
                 frame
             )
 
-            # Press Q to exit
+            # Press Q to exit the camera.
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
 finally:
+    # Release the webcam even if an error occurs.
     camera.release()
     cv2.destroyAllWindows()
 

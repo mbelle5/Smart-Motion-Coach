@@ -1,21 +1,34 @@
 
 import cv2
 import mediapipe as mp
-import numpy as np
 import time
+from pathlib import Path
+
+# Shared functions for calculating angles and accessing body landmarks.
+from core.geometry import (
+    calculate_angle,
+    world_point,
+    screen_point,
+    visible,
+)
+
 
 # ==========================================
 # SMART MOTION COACH - BICEP CURL TRACKER
 # ==========================================
 
-MODEL_PATH = "pose_landmarker_lite.task"
+# Locate the MediaPipe model relative to this script.
+MODEL_PATH = str(
+    Path(__file__).resolve().parent / "pose_landmarker_lite.task"
+)
 
 BaseOptions = mp.tasks.BaseOptions
 PoseLandmarker = mp.tasks.vision.PoseLandmarker
 PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
 RunningMode = mp.tasks.vision.RunningMode
 
-# Skeleton connections
+
+# Body connections used to draw the skeleton.
 POSE_CONNECTIONS = [
     (11, 12),
     (11, 13), (13, 15),
@@ -26,61 +39,11 @@ POSE_CONNECTIONS = [
     (24, 26), (26, 28)
 ]
 
-# Experimental elbow angle thresholds
+
+# Experimental elbow-angle thresholds.
 CURL_UP_ANGLE = 60
 CURL_DOWN_ANGLE = 150
 MIN_VISIBILITY = 0.5
-
-# ==========================================
-# ANGLE CALCULATION
-# ==========================================
-
-def calculate_angle(a, b, c):
-    """Calculate the angle at point b in 3D."""
-
-    a = np.array(a, dtype=float)
-    b = np.array(b, dtype=float)
-    c = np.array(c, dtype=float)
-
-    ba = a - b
-    bc = c - b
-
-    denominator = (
-        np.linalg.norm(ba) * np.linalg.norm(bc)
-    )
-
-    if denominator < 1e-8:
-        return None
-
-    cosine_angle = np.dot(ba, bc) / denominator
-
-    return float(
-        np.degrees(
-            np.arccos(
-                np.clip(cosine_angle, -1.0, 1.0)
-            )
-        )
-    )
-
-
-def world_point(landmarks, index):
-    landmark = landmarks[index]
-    return [landmark.x, landmark.y, landmark.z]
-
-
-def screen_point(landmarks, index, width, height):
-    landmark = landmarks[index]
-    return (
-        int(landmark.x * width),
-        int(landmark.y * height)
-    )
-
-
-def visible(landmarks, indices):
-    return all(
-        landmarks[i].visibility >= MIN_VISIBILITY
-        for i in indices
-    )
 
 
 # ==========================================
@@ -91,6 +54,7 @@ rep_count = 0
 curl_stage = "down"
 previous_feedback = ""
 feedback_until = 0
+
 
 # ==========================================
 # MEDIAPIPE SETUP
@@ -113,6 +77,7 @@ if not camera.isOpened():
 start_time = time.monotonic()
 last_timestamp_ms = -1
 
+
 # ==========================================
 # MAIN CAMERA LOOP
 # ==========================================
@@ -127,12 +92,14 @@ try:
                 print("Failed to capture frame.")
                 break
 
+            # Mirror the camera to make movement easier to follow.
             frame = cv2.flip(frame, 1)
             height, width = frame.shape[:2]
 
-            # Convert frame to RGB
+            # Convert OpenCV's BGR frame into RGB for MediaPipe.
             rgb_frame = cv2.cvtColor(
-                frame, cv2.COLOR_BGR2RGB
+                frame,
+                cv2.COLOR_BGR2RGB
             )
 
             mp_image = mp.Image(
@@ -140,12 +107,14 @@ try:
                 data=rgb_frame
             )
 
+            # Ensure timestamps increase for each video frame.
             timestamp_ms = max(
                 int((time.monotonic() - start_time) * 1000),
                 last_timestamp_ms + 1
             )
             last_timestamp_ms = timestamp_ms
 
+            # Estimate the user's pose from the webcam frame.
             result = landmarker.detect_for_video(
                 mp_image,
                 timestamp_ms
@@ -164,8 +133,13 @@ try:
                 screen_landmarks = result.pose_landmarks[0]
                 world_landmarks = result.pose_world_landmarks[0]
 
-                # Draw skeleton
+                # ==================================
+                # DRAW BODY SKELETON
+                # ==================================
+
                 for start, end in POSE_CONNECTIONS:
+
+                    # Skip joints that are not sufficiently visible.
                     if visible(screen_landmarks, [start, end]):
                         cv2.line(
                             frame,
@@ -185,7 +159,7 @@ try:
                             3
                         )
 
-                # Draw body landmarks
+                # Mark visible body joints with green circles.
                 for landmark in screen_landmarks:
                     if landmark.visibility >= MIN_VISIBILITY:
                         cv2.circle(
@@ -199,8 +173,11 @@ try:
                             -1
                         )
 
-                # Left elbow:
-                # Shoulder -> Elbow -> Wrist
+                # ==================================
+                # CALCULATE ELBOW ANGLES
+                # ==================================
+
+                # Left elbow: Shoulder -> Elbow -> Wrist
                 if visible(screen_landmarks, [11, 13, 15]):
                     left_angle = calculate_angle(
                         world_point(world_landmarks, 11),
@@ -208,8 +185,7 @@ try:
                         world_point(world_landmarks, 15)
                     )
 
-                # Right elbow:
-                # Shoulder -> Elbow -> Wrist
+                # Right elbow: Shoulder -> Elbow -> Wrist
                 if visible(screen_landmarks, [12, 14, 16]):
                     right_angle = calculate_angle(
                         world_point(world_landmarks, 12),
@@ -217,7 +193,11 @@ try:
                         world_point(world_landmarks, 16)
                     )
 
-                # Both arms must be visible
+                # ==================================
+                # BICEP CURL COUNTING
+                # ==================================
+
+                # Both arms must be visible to track a full repetition.
                 if (
                     left_angle is not None
                     and right_angle is not None
@@ -232,11 +212,11 @@ try:
                         and right_angle > CURL_DOWN_ANGLE
                     )
 
-                    # Detect curl at the top
+                    # Detect when both elbows reach the curled position.
                     if both_curled and curl_stage == "down":
                         curl_stage = "up"
 
-                    # Count rep after arms return down
+                    # Count a rep when both arms return to full extension.
                     elif both_extended and curl_stage == "up":
                         curl_stage = "down"
                         rep_count += 1
@@ -244,7 +224,10 @@ try:
 
                         print("Bicep curl completed:", rep_count)
 
-                    # Exercise feedback
+                    # ==================================
+                    # EXERCISE FEEDBACK
+                    # ==================================
+
                     if time.monotonic() < feedback_until:
                         feedback = "Rep completed!"
                         feedback_color = (0, 255, 0)
@@ -324,7 +307,10 @@ try:
                 2
             )
 
-            # Feedback banner
+            # ==================================
+            # FEEDBACK BANNER
+            # ==================================
+
             cv2.rectangle(
                 frame,
                 (0, height - 85),
@@ -337,9 +323,13 @@ try:
             font_scale = 0.85
 
             text_width = cv2.getTextSize(
-                feedback, font, font_scale, 2
+                feedback,
+                font,
+                font_scale,
+                2
             )[0][0]
 
+            # Shrink feedback text if it is wider than the camera window.
             if text_width > width - 30:
                 font_scale *= (width - 30) / text_width
 
@@ -353,22 +343,23 @@ try:
                 2
             )
 
-            # Print feedback when it changes
+            # Avoid repeating identical feedback in the terminal.
             if feedback != previous_feedback:
                 print("Exercise Feedback:", feedback)
                 previous_feedback = feedback
 
-            # Show webcam
+            # Display the camera window.
             cv2.imshow(
                 "Smart Motion Coach - Bicep Curl Tracker",
                 frame
             )
 
-            # Press Q to exit
+            # Press Q to close the tracker.
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
 finally:
+    # Always release the webcam when the program exits.
     camera.release()
     cv2.destroyAllWindows()
 

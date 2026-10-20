@@ -4,27 +4,41 @@ import mediapipe as mp
 import numpy as np
 import time
 import math
+from pathlib import Path
+
+# Shared landmark functions used across the exercise trackers.
+from core.geometry import (
+    world_point,
+    screen_point,
+    visible,
+)
+
 
 # ==========================================
 # SMART MOTION COACH - POSTURE MONITOR
 # ==========================================
 
-MODEL_PATH = "pose_landmarker_lite.task"
+# Locate the MediaPipe model relative to this script.
+MODEL_PATH = str(
+    Path(__file__).resolve().parent / "pose_landmarker_lite.task"
+)
 
 BaseOptions = mp.tasks.BaseOptions
 PoseLandmarker = mp.tasks.vision.PoseLandmarker
 PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
 RunningMode = mp.tasks.vision.RunningMode
 
-# Experimental thresholds
+
+# Experimental thresholds for posture alignment.
 SHOULDER_TILT_LIMIT = 8
 TORSO_LEAN_LIMIT = 15
 MIN_VISIBILITY = 0.5
 
-# How long poor alignment must persist
-# before a warning appears
+# Poor alignment must persist this long before a warning appears.
 WARNING_DELAY = 1.5
 
+
+# Body connections used to draw the skeleton.
 POSE_CONNECTIONS = [
     (11, 12),
     (11, 13), (13, 15),
@@ -37,42 +51,19 @@ POSE_CONNECTIONS = [
 
 
 # ==========================================
-# HELPER FUNCTIONS
+# POSTURE CALCULATIONS
 # ==========================================
-
-def world_point(landmarks, index):
-    landmark = landmarks[index]
-
-    return np.array(
-        [landmark.x, landmark.y, landmark.z],
-        dtype=float
-    )
-
-
-def screen_point(landmarks, index, width, height):
-    landmark = landmarks[index]
-
-    return (
-        int(landmark.x * width),
-        int(landmark.y * height)
-    )
-
-
-def visible(landmarks, indices):
-    return all(
-        landmarks[i].visibility >= MIN_VISIBILITY
-        for i in indices
-    )
-
 
 def calculate_shoulder_tilt(landmarks):
     """
-    Estimate shoulder height difference using
-    MediaPipe world coordinates.
+    Estimate the height difference between the shoulders
+    using MediaPipe's 3D world coordinates.
     """
 
-    left = world_point(landmarks, 11)
-    right = world_point(landmarks, 12)
+    # Convert shared world_point() output into NumPy arrays
+    # so coordinate subtraction works correctly.
+    left = np.array(world_point(landmarks, 11), dtype=float)
+    right = np.array(world_point(landmarks, 12), dtype=float)
 
     difference = right - left
 
@@ -84,6 +75,8 @@ def calculate_shoulder_tilt(landmarks):
     if horizontal_distance < 1e-8:
         return None
 
+    # Calculate the angle between the shoulder line
+    # and the horizontal plane.
     return math.degrees(
         math.atan2(
             abs(difference[1]),
@@ -94,16 +87,30 @@ def calculate_shoulder_tilt(landmarks):
 
 def calculate_torso_lean(landmarks):
     """
-    Estimate torso lean relative to vertical
-    using the shoulder and hip midpoints.
+    Estimate torso lean relative to vertical using
+    the midpoint of both shoulders and both hips.
     """
 
-    left_shoulder = world_point(landmarks, 11)
-    right_shoulder = world_point(landmarks, 12)
+    left_shoulder = np.array(
+        world_point(landmarks, 11),
+        dtype=float
+    )
+    right_shoulder = np.array(
+        world_point(landmarks, 12),
+        dtype=float
+    )
 
-    left_hip = world_point(landmarks, 23)
-    right_hip = world_point(landmarks, 24)
+    left_hip = np.array(
+        world_point(landmarks, 23),
+        dtype=float
+    )
+    right_hip = np.array(
+        world_point(landmarks, 24),
+        dtype=float
+    )
 
+    # Average the left and right joints to find
+    # the center of the shoulders and hips.
     shoulder_midpoint = (
         left_shoulder + right_shoulder
     ) / 2
@@ -121,6 +128,7 @@ def calculate_torso_lean(landmarks):
 
     vertical_distance = abs(torso_vector[1])
 
+    # Avoid calculating an angle from a zero-length vector.
     if np.linalg.norm(torso_vector) < 1e-8:
         return None
 
@@ -157,6 +165,7 @@ previous_feedback = ""
 warning_start = None
 active_warning = None
 
+
 # ==========================================
 # MAIN CAMERA LOOP
 # ==========================================
@@ -171,9 +180,11 @@ try:
                 print("Failed to capture frame.")
                 break
 
+            # Mirror the camera for easier posture tracking.
             frame = cv2.flip(frame, 1)
             height, width = frame.shape[:2]
 
+            # Convert OpenCV's BGR frame to RGB for MediaPipe.
             rgb_frame = cv2.cvtColor(
                 frame,
                 cv2.COLOR_BGR2RGB
@@ -184,12 +195,14 @@ try:
                 data=rgb_frame
             )
 
+            # Video mode requires timestamps to increase each frame.
             timestamp_ms = max(
                 int((time.monotonic() - start_time) * 1000),
                 last_timestamp_ms + 1
             )
             last_timestamp_ms = timestamp_ms
 
+            # Detect the user's pose.
             result = landmarker.detect_for_video(
                 mp_image,
                 timestamp_ms
@@ -210,13 +223,14 @@ try:
                 screen_landmarks = result.pose_landmarks[0]
                 world_landmarks = result.pose_world_landmarks[0]
 
-                # Draw skeleton connections
+                # ==================================
+                # DRAW BODY SKELETON
+                # ==================================
+
                 for start, end in POSE_CONNECTIONS:
 
-                    if visible(
-                        screen_landmarks,
-                        [start, end]
-                    ):
+                    # Only draw connections with visible landmarks.
+                    if visible(screen_landmarks, [start, end]):
                         cv2.line(
                             frame,
                             screen_point(
@@ -235,7 +249,7 @@ try:
                             3
                         )
 
-                # Draw visible landmarks
+                # Draw green circles at visible body joints.
                 for landmark in screen_landmarks:
 
                     if landmark.visibility >= MIN_VISIBILITY:
@@ -250,7 +264,11 @@ try:
                             -1
                         )
 
-                # Need shoulders and hips
+                # ==================================
+                # MEASURE POSTURE
+                # ==================================
+
+                # Both shoulders and hips must be visible.
                 if visible(
                     screen_landmarks,
                     [11, 12, 23, 24]
@@ -269,6 +287,8 @@ try:
                         and torso_lean is not None
                     ):
 
+                        # Shoulder alignment takes priority
+                        # when multiple posture issues are detected.
                         if shoulder_tilt > SHOULDER_TILT_LIMIT:
                             detected_warning = (
                                 "Check shoulder alignment"
@@ -296,18 +316,22 @@ try:
             current_time = time.monotonic()
 
             if detected_warning is None:
+                # Reset the timer when posture returns to normal
+                # or there is not enough tracking information.
                 warning_start = None
                 active_warning = None
 
             else:
+                # Start a new timer when the warning type changes.
                 if detected_warning != active_warning:
                     active_warning = detected_warning
                     warning_start = current_time
 
+                # Only display the warning if poor alignment
+                # continues for at least WARNING_DELAY seconds.
                 if (
                     warning_start is not None
-                    and current_time - warning_start
-                    >= WARNING_DELAY
+                    and current_time - warning_start >= WARNING_DELAY
                 ):
                     feedback = detected_warning
                     feedback_color = (0, 0, 255)
@@ -362,7 +386,10 @@ try:
                 2
             )
 
-            # Feedback banner
+            # ==================================
+            # FEEDBACK BANNER
+            # ==================================
+
             cv2.rectangle(
                 frame,
                 (0, height - 85),
@@ -381,10 +408,11 @@ try:
                 2
             )[0][0]
 
+            # Shrink long feedback messages to fit the camera window.
             if text_width > width - 30:
                 font_scale *= (
-                    width - 30
-                ) / text_width
+                    (width - 30) / text_width
+                )
 
             cv2.putText(
                 frame,
@@ -396,21 +424,23 @@ try:
                 2
             )
 
-            # Print feedback changes to terminal
+            # Print only when the feedback message changes.
             if feedback != previous_feedback:
                 print("Posture Feedback:", feedback)
                 previous_feedback = feedback
 
+            # Display the webcam.
             cv2.imshow(
                 "Smart Motion Coach - Posture Monitor",
                 frame
             )
 
-            # Press Q to exit
+            # Press Q to exit.
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
 finally:
+    # Release the camera even if an error occurs.
     camera.release()
     cv2.destroyAllWindows()
 
